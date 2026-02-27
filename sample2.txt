@@ -1,0 +1,17 @@
+About Local AI Models
+
+This chatbot uses several local AI models:
+
+1. Embedding Model: all-MiniLM-L6-v2
+   - Creates numerical representations of text
+   - Used for semantic search
+   - Runs completely offline
+
+2. Optional LLM Model: Orca Mini 3B
+   - Generates human-like responses
+   - Requires separate download
+   - Can be used for enhanced answers
+
+Without the LLM model, the system will show you the most relevant text passages from your documents instead of generating new answers.
+
+You can download the LLM model from the GPT4All website if you want generated responses.

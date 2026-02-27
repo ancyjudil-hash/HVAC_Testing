@@ -1,0 +1,16 @@
+Welcome to the Local RAG Chatbot!
+
+This is a sample document that demonstrates how the chatbot works.
+
+Key Features:
+- Processes documents locally on your computer
+- No API keys or internet connection required
+- Supports PDF, TXT, and Word documents
+- Uses semantic search to find relevant information
+
+How to use:
+1. Upload your documents using the sidebar
+2. Click 'Process Documents' to build the knowledge base
+3. Ask questions about your documents in the chat
+
+The system uses local machine learning models to understand and search through your documents.
