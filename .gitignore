@@ -150,3 +150,39 @@ dwg_input/"*.dwg"
 "*.csv" 
 "converted_dxf/" 
 "dwg_input/" 
+
+
+# 1. Make sure .gitignore is properly set
+echo "*.dwg
+*.dxf
+*.csv
+converted_dxf/
+dwg_input/
+.venv/
+__pycache__/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db" > .gitignore
+
+# 2. Remove everything from git index
+git rm -r --cached .
+
+# 3. Add back only what we want
+git add *.py
+git add .gitignore
+git add README.md
+# Add any other small text files you need
+git add *.txt 2>/dev/null
+git add *.md 2>/dev/null
+
+# 4. Commit
+git commit -m "Clean repository - Python files only"
+
+# 5. Force push
+git push --force origin main
+
+
+*.dxf
+*.dwg
+converted_dxf/
