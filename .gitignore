@@ -1,0 +1,141 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Input/output directories (these seem to be generated/processed files)
+converted_dxf/
+dwg_input/
+*.dwg
+*.bak
+*.dxf
+*.csv
+!sample1.txt
+!sample2.txt
+
+# Specific files to ignore (based on your listing)
+*.dwg
+*.bak
+*.csv
+*.dxf
+"AC-106 6TH FLOOR PLAN.dwg"
+"CCM-1 CONTROL ROOM AC LAYOUT.dwg"
+"House Floor Plan Sample.dwg"
+"LRF-5-CONTROL ROOM AC LAYOUT.dwg"
+"LRF-5-CONTROL ROOM AC LAYOUT.dwg 1.bak"
+"LRF-5-CONTROL ROOM AC LAYOUT.dwg 1.d..."
+"MCC & CONTROL ROOM DRI RMHS.dwg"
+"one-story-house.dwg"
+"Rahul JSW Blast Furnace Drawing.dwg"
+"Rahul-Model.dwg"
+"SEATING ARRANGEMENT OF RMHS OFFI..."
+"SEATING ARRANGEMENT Sample 1.dwg"
+"SEATING ARRANGEMENT Sample 2.dwg"
+"SEATING ARRANGEMENT Sample 3.dwg"
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Log files
+*.log
+heat_load_results.csv
+cooling_load_detailed.csv
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Streamlit specific
+.streamlit/secrets.toml
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule
+celerybeat-schedule.*
+
+# SageMath parsed files
+*.sage.py
+
+# dotenv
+.env
+
+# virtualenv
+.venv
+venv/
+ENV/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
