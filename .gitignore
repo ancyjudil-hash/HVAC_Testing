@@ -186,3 +186,5 @@ git push --force origin main
 *.dxf
 *.dwg
 converted_dxf/
+
+.env
