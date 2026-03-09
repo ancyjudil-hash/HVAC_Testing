@@ -48,7 +48,7 @@ dist/
 
 
 # Specific files to ignore
-app.py
+apps.py
 dxf_parser.py
 fix_pytorch.py
 hvac_automation.py

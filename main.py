@@ -2080,77 +2080,27 @@
 
 
 
-"""
-CAD Room Extractor + Heat Load  v11-FIXED
-No sidebar — all config hardcoded. Layer selector only. Clean UI.
-"""
 
 import streamlit as st
 import subprocess, os, math
-import importlib, subprocess as _sp
-if importlib.util.find_spec("networkx") is None:
-    _sp.run(["pip","install","networkx","--break-system-packages","-q"], check=False)
-import networkx as nx
 import ezdxf
 from ezdxf import path as dxf_path
+from ezdxf.math import Matrix44, Vec3
 import numpy as np
-from shapely.geometry import LineString, Point, MultiLineString
+from shapely.geometry import LineString, Polygon, Point, MultiLineString, MultiPoint
 from shapely.ops import polygonize, unary_union
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-# ══════════════════════════════════════════════════════
-#  HARDCODED CONFIG  (was sidebar)
-# ══════════════════════════════════════════════════════
-ODA_PATH        = r"C:\Program Files\ODA\ODAFileConverter 26.10.0\ODAFileConverter.exe"
+import importlib, subprocess as _sp
+for _pkg, _imp in [('networkx', 'networkx')]:
+    if importlib.util.find_spec(_imp) is None:
+        _sp.run(['pip', 'install', _pkg, '--break-system-packages', '-q'], check=False)
+import networkx as nx
 
-# Heat load
-H               = 3.0
-U_wall          = 1.8
-U_glass         = 5.8
-DT              = 10
-people_per_room = 2
-Q_person        = 75
-
-# Room filtering
-min_area_m2     = 2.0
-max_area_m2     = 500.0
-outer_area_pct  = 25.0
-
-# Mode B shape validation
-min_solidity        = 0.50
-max_aspect          = 15.0
-max_interior_walls  = 8
-exclude_stairs      = True
-stair_parallel_min  = 4
-stair_angle_tol     = 8.0
-max_stair_area_m2   = 20.0
-
-# Mode B bridging
-gap_close_tol   = 15.0
-max_door_width  = 1500.0
-min_wall_len    = 200.0
-
-# Mode A glass detection
-glass_edge_thresh    = 0.15
-glass_proximity_mult = 3.0
-snap_tol_a           = 10.0
-bridge_tol_a         = 80.0
-min_compact_a        = 0.04
-max_aspect_a         = 10.0
-
-# Default layer names (user can override via multiselect below)
-DEFAULT_WALL_LAYERS  = {"MAIN","MAIN-4","CEN-1","A-WALL","WALLS","WALL","WALLS","BASE","0"}
-DEFAULT_GLASS_LAYERS = {"GLASS"}
-DEFAULT_FURN_LAYERS  = {"FURNITURE","DOORS","DOOR","FURN"}
-
-NON_WALL_KW = {"furniture","plant","planter","text","vp","defpoint","dimension","dim",
-               "hatch","annotation","title","border","viewport","pplne",
-               "electrical","elec","plumbing","mech","door"}
-
-# ══════════════════════════════════════════════════════
-st.set_page_config(page_title="CAD Room Extractor", layout="wide")
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="ICAD Room Extractor", layout="wide")
 st.markdown("""
 <style>
   .main{background:#0f1117}
@@ -2159,55 +2109,142 @@ st.markdown("""
   div[data-testid="metric-container"]{
     background:#1a1f2e;border-radius:10px;
     padding:10px;border:1px solid #00d4ff33}
-  .stExpander{border:1px solid #1e3a50 !important;border-radius:8px}
 </style>
 """, unsafe_allow_html=True)
-st.title(" CAD Room Extractor ")
+st.title("🏗️ ICAD Room Extractor ")
 
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  SIDEBAR
+# ──────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    oda_path = st.text_input(
+        "ODAFileConverter Path",
+        r"C:\Program Files\ODA\ODAFileConverter 26.10.0\ODAFileConverter.exe")
+
+    st.divider()
+    st.markdown("**Layers**")
+    # v8 exact: wall and glass only — furn is extra, kept separate
+    wall_input  = st.text_area("Wall / Base layers",
+        "MAIN\nMAIN-4\nCEN-1\nA-WALL\nWALLS\nWall\nWalls\nBase\n0")
+    glass_input = st.text_area("Glass layers (leave blank = Mode B)", "GLASS")
+    furn_input  = st.text_area("Furniture / Door layers (optional)",
+        "Furniture\nDoors\nFURNITURE\nDOOR")
+
+    st.divider()
+    st.markdown("**Detection Mode**")
+    mode_override = st.selectbox(
+        "Mode",
+        ["Auto-detect",
+         "Force Glass-partition (Mode A)",
+         "Force Base-layer only (Mode B)"],
+        index=0)
+
+    st.divider()
+    st.markdown("**Heat Load**")
+    H               = st.number_input("Room Height (m)",    value=3.0,  step=0.1)
+    U_wall          = st.number_input("Wall U-Value",       value=1.8,  step=0.1)
+    U_glass         = st.number_input("Glass U-Value",      value=5.8,  step=0.1)
+    DT              = st.number_input("ΔT (°C)",            value=10,   step=1)
+    people_per_room = st.number_input("People / Room",      value=2,    step=1)
+    Q_person        = st.number_input("Heat/Person (W)",    value=75,   step=5)
+
+    st.divider()
+    st.markdown("**Room Filtering**")
+    min_area_m2 = st.number_input("Min Room Area (m²)",  value=2.0,   step=0.5)
+    max_area_m2 = st.number_input("Max Room Area (m²)",  value=300.0, step=10.0)
+
+    st.divider()
+    st.markdown("**Shape Quality — Mode A (v8 exact)**")
+    min_compact  = st.number_input("Min Compactness",  value=0.04, step=0.01,
+        help="v8 default=0.04. 4π·area/perimeter². Low = jagged/non-room shape.")
+    max_aspect_a = st.number_input("Max Aspect Ratio", value=10.0, step=0.5,
+        help="v8 default=10.0. BoundingBox max/min. Very thin strips excluded.")
+
+    st.divider()
+    st.markdown("**Gap Closing — Mode A (v8 exact)**")
+    snap_tol   = st.number_input("Snap tolerance",   value=10.0, step=1.0)
+    bridge_tol = st.number_input("Bridge tolerance", value=80.0, step=5.0)
+
+    st.divider()
+    st.markdown("**Glass Detection — Mode A (v8 exact)**")
+    glass_edge_thresh    = st.number_input(
+        "Glass edge threshold (0–1)", value=0.15, step=0.05,
+        help="v8 default=0.15. Standalone rooms: fraction of perimeter near glass.")
+    glass_proximity_mult = st.number_input(
+        "Glass proximity multiplier", value=3.0, step=0.5,
+        min_value=1.0, max_value=10.0,
+        help="v8 default=3.0. snap_tol × this = glass search radius.")
+
+    st.divider()
+    st.markdown("**Shape Validation — Mode B**")
+    outer_area_pct_b   = st.number_input("Outer envelope threshold (%)", value=25.0, step=5.0)
+    min_solidity       = st.number_input("Min solidity (0–1)", value=0.50, step=0.05,
+                                          min_value=0.0, max_value=1.0)
+    max_aspect_b       = st.number_input("Max aspect ratio (Mode B)", value=15.0, step=1.0)
+    max_interior_walls = st.number_input("Max interior wall segments", value=8, step=1)
+    exclude_stairs     = st.checkbox("Exclude staircase regions", value=True)
+    stair_parallel_min = st.number_input("Min parallel lines → stair", value=4, step=1)
+    stair_angle_tol    = st.number_input("Stair angle tolerance (°)", value=8.0, step=1.0)
+    max_stair_area_m2  = st.number_input("Max staircase area (m²)",   value=20.0, step=1.0)
+
+    st.divider()
+    st.markdown("**Bridging — Mode B**")
+    gap_close_tol  = st.number_input("Snap/merge tolerance (mm)",    value=15.0,   step=5.0)
+    max_door_width = st.number_input("Max door/archway width (mm)",  value=1500.0, step=100.0)
+    min_wall_len   = st.number_input("Min wall segment length (mm)", value=200.0,  step=50.0)
+
+    st.divider()
+    show_debug = st.checkbox("Show debug info",   value=True)
+    show_raw   = st.checkbox("Show raw geometry", value=False)
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  FILE UPLOAD
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("📂 Upload DWG File", type=["dwg"])
 if not uploaded_file:
-    st.info("👆 Upload a DWG file to begin."); st.stop()
+    st.info("👆 Upload a DWG file to begin.")
+    st.stop()
 
 dwg_filename  = uploaded_file.name
 dwg_path_file = os.path.join(os.getcwd(), dwg_filename)
 with open(dwg_path_file, "wb") as f:
     f.write(uploaded_file.getbuffer())
-st.success(f"✅ Uploaded: **{dwg_filename}**")
+st.success(f"Uploaded: **{dwg_filename}**")
 
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  ODA CONVERSION
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 dxf_folder = os.path.join(os.getcwd(), "converted_dxf")
 os.makedirs(dxf_folder, exist_ok=True)
 with st.spinner("🔄 Converting DWG → DXF…"):
     try:
         subprocess.run(
-            [ODA_PATH, os.getcwd(), dxf_folder, "ACAD2013", "DXF", "0", "1"],
+            [oda_path, os.getcwd(), dxf_folder, "ACAD2013", "DXF", "0", "1"],
             check=True, capture_output=True, text=True, timeout=120)
+        st.success("✅ ODA conversion OK")
     except subprocess.CalledProcessError as e:
-        st.error(f"ODA conversion failed: {e.stderr}"); st.stop()
+        st.error(f"ODA failed: {e.stderr}"); st.stop()
     except FileNotFoundError:
-        st.error(f"ODAFileConverter not found at:\n`{ODA_PATH}`"); st.stop()
+        st.error("ODAFileConverter.exe not found."); st.stop()
 
 dxf_name      = dwg_filename.rsplit(".", 1)[0] + ".dxf"
 dxf_path_conv = os.path.join(dxf_folder, dxf_name)
 if not os.path.exists(dxf_path_conv):
     hits = [f for f in os.listdir(dxf_folder) if f.endswith(".dxf")]
-    if not hits: st.error("No DXF file found after conversion."); st.stop()
+    if not hits:
+        st.error("No DXF found after conversion."); st.stop()
     dxf_path_conv = os.path.join(dxf_folder, hits[0])
 
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  LOAD DXF
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     doc = ezdxf.readfile(dxf_path_conv)
 except Exception as e:
     st.error(f"DXF load error: {e}"); st.stop()
 
-msp = doc.modelspace()
+msp                = doc.modelspace()
 all_layers_in_file = {layer.dxf.name for layer in doc.layers}
 
 layer_entity_count = {}
@@ -2219,101 +2256,271 @@ sorted_layers = sorted(all_layers_in_file,
     key=lambda l: layer_entity_count.get(l, 0), reverse=True)
 active_layers = [l for l in sorted_layers if layer_entity_count.get(l, 0) > 0]
 
-# ══════════════════════════════════════════════════════
-#  LAYER SELECTOR  (clean, no debug clutter)
-# ══════════════════════════════════════════════════════
-file_layers_upper = {x.upper() for x in all_layers_in_file}
+# ── Parse sidebar text-area values (ground truth — never overwritten to empty) ──
+WALL_LAYERS_DEFAULT  = {l.strip().upper() for l in wall_input.strip().splitlines()  if l.strip()}
+GLASS_LAYERS_DEFAULT = {l.strip().upper() for l in glass_input.strip().splitlines() if l.strip()}
+FURN_LAYERS_DEFAULT  = {l.strip().upper() for l in furn_input.strip().splitlines()  if l.strip()}
 
-# Smart defaults
-matched_wall_def  = [l for l in active_layers if l.upper() in DEFAULT_WALL_LAYERS]
-matched_glass_def = [l for l in active_layers if l.upper() in DEFAULT_GLASS_LAYERS]
-matched_furn_def  = [l for l in active_layers if l.upper() in DEFAULT_FURN_LAYERS]
+WALL_LAYERS  = WALL_LAYERS_DEFAULT.copy()
+GLASS_LAYERS = GLASS_LAYERS_DEFAULT.copy()
+FURN_LAYERS  = FURN_LAYERS_DEFAULT.copy()
 
-# If no match, auto-suggest non-furniture layers
-if not matched_wall_def:
-    matched_wall_def = [l for l in active_layers
-                        if not any(kw in l.lower() for kw in NON_WALL_KW)][:5]
+matched_wall  = WALL_LAYERS  & {x.upper() for x in all_layers_in_file}
+matched_glass = GLASS_LAYERS & {x.upper() for x in all_layers_in_file}
+matched_furn  = FURN_LAYERS  & {x.upper() for x in all_layers_in_file}
 
-with st.expander("🗂️ Layer Selection", expanded=True):
-    # Show layer table
-    col_left, col_right = st.columns([1, 1])
-    with col_left:
-        st.markdown("**Layers in file** *(by entity count)*")
-        rows = []
-        for l in active_layers[:30]:   # show top 30 only
+matched_wall_ents = sum(layer_entity_count.get(l, 0)
+    for l in all_layers_in_file if l.upper() in matched_wall)
+total_ents = sum(layer_entity_count.values()) or 1
+poor_match = matched_wall_ents < total_ents * 0.20
+
+NON_WALL_KW = {"furniture","plant","planter","text","vp","defpoint",
+               "dimension","dim","hatch","annotation","title","border",
+               "viewport","electrical","elec","plumbing","mech","door"}
+
+# ── Layer selector UI ──
+with st.expander("🔍 Layer debug & selector", expanded=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Layers in DXF (by entity count):**")
+        for l in sorted_layers:
             cnt = layer_entity_count.get(l, 0)
-            if l.upper() in DEFAULT_WALL_LAYERS:
-                badge = "🟩 Wall"
-            elif l.upper() in DEFAULT_GLASS_LAYERS:
-                badge = "🟦 Glass"
-            elif l.upper() in DEFAULT_FURN_LAYERS:
-                badge = "🪑 Furn"
-            else:
-                badge = "⚪"
-            rows.append({"Layer": l, "Entities": cnt, "Type": badge})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                     height=min(35 * len(rows) + 38, 400))
+            tag = ("🟩 WALL"  if l.upper() in WALL_LAYERS
+              else ("🟦 GLASS" if l.upper() in GLASS_LAYERS
+              else ("🪑 FURN"  if l.upper() in FURN_LAYERS else "⚪")))
+            st.markdown(f"{tag} `{l}` — {cnt} entities")
+    with col2:
+        if matched_wall and not poor_match:
+            st.success(f"Wall layers matched: {sorted(matched_wall)} ✅")
+        else:
+            st.warning("⚠️ Poor wall layer match — select below")
 
-    with col_right:
-        sel_wall  = st.multiselect(
-            "🟩 Wall / Base layers",
-            options=active_layers,
-            default=matched_wall_def,
-            key="sel_wall")
-        sel_glass = st.multiselect(
-            "🟦 Glass layers  *(leave empty = base-only mode)*",
-            options=active_layers,
-            default=matched_glass_def,
-            key="sel_glass")
-        sel_furn  = st.multiselect(
-            "🪑 Furniture / Door layers",
-            options=active_layers,
-            default=matched_furn_def,
-            key="sel_furn")
+        if matched_glass:
+            st.success(f"Glass layers matched: {sorted(matched_glass)} ✅")
+        else:
+            st.warning(f"⚠️ Glass layer(s) {sorted(GLASS_LAYERS)} not found in file — "
+                       f"will use Mode B or check layer name")
 
-        if not sel_wall:
-            st.warning("⚠️ No wall layers selected — select at least one.")
-            st.stop()
+        smart_def    = [l for l in active_layers
+                        if not any(kw in l.lower() for kw in NON_WALL_KW)]
+        wall_default  = [l for l in active_layers if l.upper() in matched_wall] or \
+                        (smart_def if poor_match else [])
+        glass_default = [l for l in active_layers if l.upper() in matched_glass]
+        furn_default  = [l for l in active_layers if l.upper() in matched_furn]
 
-WALL_LAYERS  = {l.upper() for l in sel_wall}
-GLASS_LAYERS = {l.upper() for l in sel_glass}
-FURN_LAYERS  = {l.upper() for l in sel_furn}
+        sel_wall  = st.multiselect("Wall / Base layers",               options=active_layers,
+                                    default=wall_default,  key="sel_wall")
+        sel_glass = st.multiselect("Glass layers (optional)",          options=active_layers,
+                                    default=glass_default, key="sel_glass")
+        sel_furn  = st.multiselect("Furniture/Door layers (optional)", options=active_layers,
+                                    default=furn_default,  key="sel_furn")
 
-# ══════════════════════════════════════════════════════
-#  MODE + SCALE
-# ══════════════════════════════════════════════════════
-USE_GLASS_MODE = bool(GLASS_LAYERS & file_layers_upper)
-mode_label = ("🔵 Mode A — Glass-partition"
-              if USE_GLASS_MODE else
-              "🟩 Mode B — Base-layer (endpoint-bridging)")
+        # DIFF 2 FIX: Only override if user made a NON-EMPTY selection.
+        # Never assign empty set — preserves text-area default.
+        if sel_wall:
+            WALL_LAYERS = {l.upper() for l in sel_wall}
+        if sel_glass:
+            GLASS_LAYERS = {l.upper() for l in sel_glass}
+        # If sel_glass=[] → GLASS_LAYERS stays = GLASS_LAYERS_DEFAULT (text-area value)
+        if sel_furn:
+            FURN_LAYERS = {l.upper() for l in sel_furn}
 
-insunits      = doc.header.get("$INSUNITS", 0)
-scale_map     = {0:1.0, 1:25.4, 2:304.8, 4:1.0, 5:10.0, 6:1000.0}
-unit_names    = {0:"Unitless", 1:"Inches", 2:"Feet", 4:"mm", 5:"cm", 6:"m"}
-DRAWING_SCALE = scale_map.get(insunits, 1.0)
+        matched_glass = GLASS_LAYERS & {x.upper() for x in all_layers_in_file}
+        st.caption(f"Active: wall={sorted(WALL_LAYERS)} | glass={sorted(GLASS_LAYERS)}")
 
-# Single clean status bar
-st.info(f"**{mode_label}** | "
-        f"$INSUNITS={insunits} ({unit_names.get(insunits,'?')}) → ×{DRAWING_SCALE} | "
-        f"Wall layers: {', '.join(sorted(WALL_LAYERS))}")
+# DIFF 4 FIX: Mode A uses WALL+GLASS only (no FURN contamination)
+# DIFF 3 FIX: Check both doc.layers AND entity-level scan for glass
+all_entity_layers_upper = set()
+for ent in msp:
+    all_entity_layers_upper.add(ent.dxf.get("layer", "0").upper())
 
-# ══════════════════════════════════════════════════════
-#  GEOMETRY EXTRACTION
-# ══════════════════════════════════════════════════════
-def process_entity(entity, raw_lines, scale, exclude_arcs=False):
-    if entity.dxftype() == "INSERT":
+# glass_found: glass layer exists at entity level (catches INSERT block sub-layers too)
+glass_found = bool(GLASS_LAYERS & all_entity_layers_upper)
+if not glass_found and GLASS_LAYERS:
+    # Also check inside INSERT blocks (1 level deep)
+    for ent in msp:
+        if ent.dxftype() == 'INSERT':
+            try:
+                bname = ent.dxf.name
+                if bname in doc.blocks:
+                    for sub in doc.blocks[bname]:
+                        sl = sub.dxf.get("layer","0").upper()
+                        if sl in GLASS_LAYERS:
+                            glass_found = True
+                            break
+            except Exception:
+                pass
+        if glass_found:
+            break
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MODE DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+if mode_override == "Force Glass-partition (Mode A)":
+    USE_GLASS_MODE = True
+elif mode_override == "Force Base-layer only (Mode B)":
+    USE_GLASS_MODE = False
+else:
+    USE_GLASS_MODE = bool(GLASS_LAYERS) and glass_found
+
+mode_label = ("🔵 Mode A: Glass-partition "
+              if USE_GLASS_MODE
+              else "🟩 Mode B: Base-layer (endpoint-bridging)")
+st.info(f"**Detection Mode:** {mode_label}")
+
+# DIFF 4 FIX: Separate allowed-layer sets for each mode
+ALLOWED_LAYERS_A = WALL_LAYERS | GLASS_LAYERS          # v8 exact: no FURN in Mode A
+ALLOWED_LAYERS_B = WALL_LAYERS | GLASS_LAYERS | FURN_LAYERS
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SCALE DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+insunits        = doc.header.get('$INSUNITS', 0)
+scale_map       = {0: 1.0, 1: 25.4, 2: 304.8, 4: 1.0, 5: 10.0, 6: 1000.0}
+unit_names      = {0: "Unitless", 1: "Inches", 2: "Feet", 4: "mm", 5: "cm", 6: "m"}
+DRAWING_SCALE_B = scale_map.get(insunits, 1.0)
+st.info(f"📏 $INSUNITS={insunits} ({unit_names.get(insunits,'?')}) → Mode B scale×{DRAWING_SCALE_B}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  GEOMETRY EXTRACTION HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+GEOM_TYPES = {"LINE","LWPOLYLINE","POLYLINE","ARC","CIRCLE","ELLIPSE","SPLINE"}
+
+def apply_m44(mat, x, y):
+    v = mat.transform(Vec3(x, y, 0))
+    return (v.x, v.y)
+
+def effective_layer(entity, parent_layer):
+    """v8 exact: entities on layer '0' inherit the parent block's layer."""
+    own = entity.dxf.get("layer", "0")
+    return parent_layer if own == "0" else own
+
+def build_matrix(ent):
+    try:
+        return ent.matrix44()
+    except Exception:
+        ix  = ent.dxf.insert.x;  iy = ent.dxf.insert.y
+        rot = math.radians(ent.dxf.get("rotation", 0))
+        sx  = ent.dxf.get("xscale", 1);  sy = ent.dxf.get("yscale", 1)
+        c, s = math.cos(rot), math.sin(rot)
+        return Matrix44([[sx*c,-sy*s,0,ix],[sx*s,sy*c,0,iy],[0,0,1,0],[0,0,0,1]])
+
+def ent_to_segments(entity, mat, layer, glass_layers_up):
+    """
+    v8 EXACT: entity → list of (LineString, is_glass, is_arc).
+    
+    ARC rule (v8 original):
+      - All 31 tessellation segments: (LineString, is_glass, True)
+      - Closing chord: (LineString, False, True)   ← is_glass=False even for glass arcs
+    
+    LWPOLYLINE: ALL vertices preserved, no chord stripping.
+    """
+    t        = entity.dxftype()
+    is_glass = layer.upper() in glass_layers_up
+    res      = []
+    try:
+        if t == "LINE":
+            p1 = apply_m44(mat, entity.dxf.start.x, entity.dxf.start.y)
+            p2 = apply_m44(mat, entity.dxf.end.x,   entity.dxf.end.y)
+            if p1 != p2:
+                res.append((LineString([p1, p2]), is_glass, False))
+
+        elif t == "LWPOLYLINE":
+            pts = [apply_m44(mat, p[0], p[1]) for p in entity.get_points()]
+            closed = entity.closed or (len(pts) > 2 and pts[0] == pts[-1])
+            if closed and pts and pts[0] != pts[-1]:
+                pts.append(pts[0])
+            for a, b in zip(pts[:-1], pts[1:]):
+                if a != b:
+                    res.append((LineString([a, b]), is_glass, False))
+
+        elif t == "POLYLINE":
+            pts = [apply_m44(mat, v.dxf.location.x, v.dxf.location.y)
+                   for v in entity.vertices if hasattr(v.dxf, "location")]
+            for a, b in zip(pts[:-1], pts[1:]):
+                if a != b:
+                    res.append((LineString([a, b]), is_glass, False))
+
+        elif t == "ARC":
+            cx = entity.dxf.center.x;  cy = entity.dxf.center.y
+            r  = entity.dxf.radius
+            sa = math.radians(entity.dxf.start_angle)
+            ea = math.radians(entity.dxf.end_angle)
+            if ea <= sa:
+                ea += 2 * math.pi
+            angles = np.linspace(sa, ea, 32)
+            pts = [apply_m44(mat, cx + r*math.cos(a), cy + r*math.sin(a)) for a in angles]
+            if len(pts) >= 2:
+                for a, b in zip(pts[:-1], pts[1:]):
+                    if a != b:
+                        # v8 exact: tessellation segs carry is_glass flag
+                        res.append((LineString([a, b]), is_glass, True))
+                # v8 exact: closing chord is_glass=False, is_arc=True
+                res.append((LineString([pts[0], pts[-1]]), False, True))
+
+        elif t == "CIRCLE":
+            cx = entity.dxf.center.x;  cy = entity.dxf.center.y
+            r  = entity.dxf.radius
+            angles = np.linspace(0, 2*math.pi, 64)
+            pts = [apply_m44(mat, cx+r*math.cos(a), cy+r*math.sin(a)) for a in angles]
+            for a, b in zip(pts[:-1], pts[1:]):
+                if a != b:
+                    res.append((LineString([a, b]), is_glass, False))
+
+        elif t == "SPLINE":
+            try:    raw_pts = [(p[0],p[1]) for p in entity.control_points]
+            except: raw_pts = []
+            if len(raw_pts) < 2:
+                try:    raw_pts = [(p[0],p[1]) for p in entity.fit_points]
+                except: raw_pts = []
+            pts = [apply_m44(mat, x, y) for x, y in raw_pts]
+            for a, b in zip(pts[:-1], pts[1:]):
+                if a != b:
+                    res.append((LineString([a, b]), is_glass, False))
+    except Exception:
+        pass
+    return res
+
+def extract_all_v8(layout, doc, allowed_up, glass_layers_up,
+                   parent_mat=None, parent_layer="0", depth=0):
+    """v8 exact: recursive INSERT traversal with effective_layer() inheritance."""
+    if depth > 30:
+        return []
+    if parent_mat is None:
+        parent_mat = Matrix44()
+    out = []
+    for ent in layout:
+        et = ent.dxftype()
+        if et == "INSERT":
+            bname = ent.dxf.name
+            if bname not in doc.blocks:
+                continue
+            ins_layer = ent.dxf.get("layer", parent_layer)
+            combined  = parent_mat @ build_matrix(ent)
+            out.extend(extract_all_v8(doc.blocks[bname], doc, allowed_up,
+                                       glass_layers_up, combined, ins_layer, depth+1))
+        elif et in GEOM_TYPES:
+            eff = effective_layer(ent, parent_layer).upper()
+            if eff not in allowed_up:
+                continue
+            out.extend(ent_to_segments(ent, parent_mat, eff, glass_layers_up))
+    return out
+
+def process_entity_v11(entity, raw_lines, scale, exclude_arcs=False):
+    """v11 path-flattening for Mode B only."""
+    if entity.dxftype() == 'INSERT':
         try:
             for sub in entity.virtual_entities():
-                process_entity(sub, raw_lines, scale, exclude_arcs)
+                process_entity_v11(sub, raw_lines, scale, exclude_arcs)
         except Exception:
             pass
         return
-    if exclude_arcs and entity.dxftype() == "ARC":
+    if exclude_arcs and entity.dxftype() == 'ARC':
         return
     try:
         p   = dxf_path.make_path(entity)
         pts = list(p.flattening(distance=0.1))
-        for i in range(len(pts) - 1):
+        for i in range(len(pts)-1):
             s = (round(pts[i].x   * scale, 1), round(pts[i].y   * scale, 1))
             e = (round(pts[i+1].x * scale, 1), round(pts[i+1].y * scale, 1))
             if s != e:
@@ -2321,451 +2528,678 @@ def process_entity(entity, raw_lines, scale, exclude_arcs=False):
     except Exception:
         pass
 
+# ── Run extraction ──
 with st.spinner("🔍 Extracting geometry…"):
-    raw_wall_lines  = []
-    raw_glass_lines = []
-    raw_furn_lines  = []
-    for ent in msp.query("LINE LWPOLYLINE POLYLINE INSERT ARC CIRCLE ELLIPSE SPLINE"):
-        lu = ent.dxf.get("layer","0").upper()
-        if lu in WALL_LAYERS:
-            process_entity(ent, raw_wall_lines,  DRAWING_SCALE, exclude_arcs=(not USE_GLASS_MODE))
-        elif lu in GLASS_LAYERS:
-            process_entity(ent, raw_glass_lines, DRAWING_SCALE, False)
-        elif lu in FURN_LAYERS:
-            process_entity(ent, raw_furn_lines,  DRAWING_SCALE, False)
+    if USE_GLASS_MODE:
+        # DIFF 4 FIX: Use ALLOWED_LAYERS_A (no FURN), matching v8 exactly
+        raw_a = extract_all_v8(msp, doc, ALLOWED_LAYERS_A, GLASS_LAYERS)
 
-if not raw_wall_lines:
-    st.error(f"❌ No geometry found on wall layers: {sorted(WALL_LAYERS)}")
-    st.stop()
+        # ════════════════════════════════════════════════════════════════
+        # DIFF 1 FIX — v8 EXACT segment classification:
+        #
+        #   wall_segs:  not glass AND not arc       (ig=False, ia=False)
+        #   glass_segs: glass AND not arc           (ig=True,  ia=False)  ← NOT ia
+        #   arc_segs:   ANY arc flag                (ia=True)             ← ALL arcs
+        #
+        # WHY: In v8, glass ARC tessellation segs (ig=True, ia=True) go into arc_segs.
+        # They reach arc_snapped → boundary_snapped → polygonize() boundary.
+        # They do NOT go into glass_snapped → glass_union does NOT include arc geometry.
+        # This is the v8 original behavior. Do NOT change this.
+        # ════════════════════════════════════════════════════════════════
+        wall_segs  = [g for (g, ig, ia) in raw_a if not ig and not ia]  # v8 exact
+        glass_segs = [g for (g, ig, ia) in raw_a if ig  and not ia]     # v8 exact ← NOT ia
+        arc_segs   = [g for (g, ig, ia) in raw_a if ia]                 # v8 exact ← ALL arcs
+        all_segs_display = [g for (g, _, _) in raw_a]
 
-# Unit auto-detect
-_xs         = [pt[0] for seg in raw_wall_lines + raw_glass_lines for pt in seg]
-_span       = (max(_xs) - min(_xs)) if _xs else 1.0
-unit_guess  = "mm" if _span > 500 else "m"
-unit_factor = 1_000_000.0 if unit_guess == "mm" else 1.0
-unit_div    = 1_000.0     if unit_guess == "mm" else 1.0
+        st.success(f"✅ [Mode A] {len(raw_a)} segments  "
+                   f"(wall:{len(wall_segs)}  glass:{len(glass_segs)}  arc/chord:{len(arc_segs)})")
+        if show_debug:
+            with st.expander("📊 Mode A segment counts"):
+                st.markdown(f"- 🟩 Wall: **{len(wall_segs)}**")
+                st.markdown(f"- 🟦 Glass: **{len(glass_segs)}**")
+                st.markdown(f"- 🚪 Arc/chord: **{len(arc_segs)}**")
 
-# ══════════════════════════════════════════════════════
-#  FURNITURE OBJECTS
-# ══════════════════════════════════════════════════════
+        # v8 exact span-based unit detection
+        all_xs = [c[0] for ls in wall_segs + glass_segs for c in ls.coords]
+        if not all_xs:
+            st.error("No wall/glass coordinates found. Check layer names."); st.stop()
+        span        = max(all_xs) - min(all_xs)
+        unit_guess  = "mm" if span > 500 else "m"
+        unit_factor = 1_000_000 if unit_guess == "mm" else 1.0   # v8 exact: int 1_000_000
+        unit_div    = 1000      if unit_guess == "mm" else 1      # v8 exact: int 1000
+        st.info(f"📏 [Mode A] Units: **{unit_guess}** | Span: {span:.0f}")
+
+        # Mode B variables unused in Mode A
+        raw_wall_lines  = []
+        raw_glass_lines = []
+        raw_furn_lines  = []
+
+    else:
+        # Mode B extraction
+        raw_wall_lines  = []
+        raw_glass_lines = []
+        raw_furn_lines  = []
+        wall_segs       = []
+        glass_segs      = []
+        arc_segs        = []
+
+        for ent in msp.query('LINE LWPOLYLINE POLYLINE INSERT ARC CIRCLE ELLIPSE SPLINE'):
+            layer_up = ent.dxf.get("layer", "0").upper()
+            if layer_up in WALL_LAYERS:
+                process_entity_v11(ent, raw_wall_lines,  DRAWING_SCALE_B, exclude_arcs=True)
+            elif layer_up in GLASS_LAYERS:
+                process_entity_v11(ent, raw_glass_lines, DRAWING_SCALE_B, False)
+            elif layer_up in FURN_LAYERS:
+                process_entity_v11(ent, raw_furn_lines,  DRAWING_SCALE_B, False)
+
+        unit_factor      = 1_000_000.0
+        unit_div         = 1_000.0
+        all_segs_display = [LineString(l) for l in raw_wall_lines]
+        st.success(f"✅ [Mode B] wall:{len(raw_wall_lines)}  "
+                   f"glass:{len(raw_glass_lines)}  furn:{len(raw_furn_lines)}")
+
+has_geometry = (USE_GLASS_MODE and len(wall_segs) > 0) or \
+               (not USE_GLASS_MODE and len(raw_wall_lines) > 0)
+if not has_geometry:
+    st.error(f"❌ No geometry on wall layers {sorted(WALL_LAYERS)}."); st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FURNITURE → OBJECTS (v11 feature, Mode B only in practice)
+# ──────────────────────────────────────────────────────────────────────────────
 def process_furniture_to_objects(furn_lines, gap_tol=50):
-    if not furn_lines: return []
+    if not furn_lines:
+        return []
     from shapely.strtree import STRtree
-    sl  = [LineString(l) for l in furn_lines]
-    buf = [l.buffer(gap_tol) for l in sl]
-    tree = STRtree(buf)
-    G = nx.Graph(); G.add_nodes_from(range(len(furn_lines)))
-    for i, p in enumerate(buf):
-        for j in tree.query(p):
-            if i != j and p.intersects(buf[j]):
+    shapely_lines = [LineString(l) for l in furn_lines]
+    buffered      = [ls.buffer(gap_tol) for ls in shapely_lines]
+    tree = STRtree(buffered)
+    G    = nx.Graph()
+    G.add_nodes_from(range(len(furn_lines)))
+    for i, poly in enumerate(buffered):
+        for j in tree.query(poly):
+            if i != j and poly.intersects(buffered[j]):
                 G.add_edge(i, j)
-    out = []
+    objects_data = []
     for comp in nx.connected_components(G):
         lines = [furn_lines[idx] for idx in comp]
         mls   = MultiLineString([LineString(l) for l in lines])
-        minx,miny,maxx,maxy = mls.bounds
-        out.append({"object_id":f"Obj {len(out)+1}",
-                    "center_x":round(mls.centroid.x,2),
-                    "center_y":round(mls.centroid.y,2),
-                    "point":mls.centroid})
-    return out
+        minx, miny, maxx, maxy = mls.bounds
+        objects_data.append({
+            "object_id": f"Obj {len(objects_data)+1}",
+            "length":    round(maxx-minx, 2),
+            "width":     round(maxy-miny, 2),
+            "center_x":  round(mls.centroid.x, 2),
+            "center_y":  round(mls.centroid.y, 2),
+            "point":     mls.centroid,
+        })
+    return objects_data
 
-with st.spinner("🪑 Clustering furniture objects…"):
+with st.spinner("🪑 Processing furniture objects…"):
     extracted_objects = process_furniture_to_objects(raw_furn_lines)
+if show_debug:
+    st.info(f"Furniture objects: **{len(extracted_objects)}**")
 
-# ══════════════════════════════════════════════════════
-#  GLASS HELPERS  (Mode A)
-# ══════════════════════════════════════════════════════
-raw_glass_segs = [LineString(l) for l in raw_glass_lines]
-
-def edge_glass_fraction(poly, gu, tol, mult):
-    if gu is None or gu.is_empty: return 0.0
-    coords = list(poly.exterior.coords); total = gls = 0.0; cd = tol*mult
+# ──────────────────────────────────────────────────────────────────────────────
+#  GLASS EDGE HELPERS  (v8 exact — unchanged from v8 standalone)
+# ──────────────────────────────────────────────────────────────────────────────
+def edge_glass_fraction(poly, glass_u, tol, mult):
+    """v8 exact: 3-point sampling per edge (mid + 2 quarter-points)."""
+    if glass_u is None or glass_u.is_empty:
+        return 0.0
+    coords    = list(poly.exterior.coords)
+    total_len = 0.0
+    glass_len = 0.0
+    cd        = tol * mult
     for i in range(len(coords)-1):
-        p1,p2=coords[i],coords[i+1]; sl=math.hypot(p2[0]-p1[0],p2[1]-p1[1])
-        mid=((p1[0]+p2[0])/2,(p1[1]+p2[1])/2)
-        q1=((p1[0]*3+p2[0])/4,(p1[1]*3+p2[1])/4)
-        q2=((p1[0]+p2[0]*3)/4,(p1[1]+p2[1]*3)/4)
-        total+=sl
-        if any(gu.distance(Point(p))<=cd for p in (mid,q1,q2)): gls+=sl
-    return 0.0 if total==0 else min(gls/total,1.0)
+        p1, p2  = coords[i], coords[i+1]
+        seg_len = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+        mid     = ((p1[0]+p2[0])/2,      (p1[1]+p2[1])/2)
+        qtr1    = ((p1[0]*3+p2[0])/4,    (p1[1]*3+p2[1])/4)
+        qtr2    = ((p1[0]+p2[0]*3)/4,    (p1[1]+p2[1]*3)/4)
+        total_len += seg_len
+        if any(glass_u.distance(Point(p)) <= cd for p in (mid, qtr1, qtr2)):
+            glass_len += seg_len
+    return 0.0 if total_len == 0 else min(glass_len/total_len, 1.0)
 
-def has_any_glass_edge(poly, gu, tol, mult):
-    if gu is None or gu.is_empty: return False
-    coords = list(poly.exterior.coords); cd = tol*mult
+def has_any_glass_edge(poly, glass_u, tol, mult):
+    """v8 exact binary check: any edge near glass?"""
+    if glass_u is None or glass_u.is_empty:
+        return False
+    coords = list(poly.exterior.coords)
+    cd     = tol * mult
     for i in range(len(coords)-1):
-        p1,p2=coords[i],coords[i+1]
-        mid=((p1[0]+p2[0])/2,(p1[1]+p2[1])/2)
-        q1=((p1[0]*3+p2[0])/4,(p1[1]*3+p2[1])/4)
-        q2=((p1[0]+p2[0]*3)/4,(p1[1]+p2[1]*3)/4)
-        if any(gu.distance(Point(p))<=cd for p in (mid,q1,q2)): return True
+        p1, p2 = coords[i], coords[i+1]
+        mid    = ((p1[0]+p2[0])/2,   (p1[1]+p2[1])/2)
+        qtr1   = ((p1[0]*3+p2[0])/4, (p1[1]*3+p2[1])/4)
+        qtr2   = ((p1[0]+p2[0]*3)/4, (p1[1]+p2[1]*3)/4)
+        if any(glass_u.distance(Point(p)) <= cd for p in (mid, qtr1, qtr2)):
+            return True
     return False
 
-# ══════════════════════════════════════════════════════
-#  MODE A ENGINE
-# ══════════════════════════════════════════════════════
-def detect_rooms_mode_a(raw_wall_lines, raw_glass_segs, snap_tol, bridge_tol,
-                         glass_edge_thresh, glass_proximity_mult,
-                         min_area_m2, max_area_m2, unit_factor,
-                         min_compact, max_aspect_ratio):
+# ──────────────────────────────────────────────────────────────────────────────
+#  SHAPE QUALITY HELPERS  (v8 exact)
+# ──────────────────────────────────────────────────────────────────────────────
+def compactness(poly):
+    if poly.length == 0: return 0
+    return (4 * math.pi * poly.area) / (poly.length ** 2)
 
-    def node_snap(segs, tol):
-        out=[]
+def aspect_ratio(poly):
+    minx, miny, maxx, maxy = poly.bounds
+    w = maxx-minx;  h = maxy-miny
+    if min(w,h) == 0: return 999
+    return max(w,h) / min(w,h)
+
+def is_outer_envelope(poly, all_p, threshold=0.35):
+    """v8 exact name and logic."""
+    others = [p for p in all_p if p is not poly]
+    if not others: return False
+    n = sum(1 for p in others if poly.contains(p.centroid))
+    return (n / len(others)) >= threshold
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MODE A — v8 EXACT DETECTION ENGINE
+#
+#  This function is a direct port of v8 standalone detection logic.
+#  Parameter names, variable names, and logic order all match v8 exactly.
+# ──────────────────────────────────────────────────────────────────────────────
+def detect_rooms_mode_a(wall_segs, glass_segs, arc_segs,
+                         snap_tol, bridge_tol,
+                         glass_edge_thresh, glass_proximity_mult,
+                         min_area_m2, max_area_m2,
+                         min_compact, max_aspect,
+                         unit_factor,
+                         show_debug=False):
+    """
+    v8 EXACT detection pipeline. Steps match v8 standalone 1:1:
+    1. node_snap_segs: wall_segs, glass_segs, arc_segs SEPARATELY
+    2. boundary_snapped = wall_sn + glass_sn + arc_sn
+    3. bridge_gaps(boundary_snapped, bridge_tol)
+    4. polygonize(unary_union(boundary + bridges))
+    5. glass_union = unary_union(glass_sn)  ← snapped glass only, not arc
+    6. is_outer_envelope [:5] check (threshold=0.35)
+    7. Pass 1: area + compactness + aspect_ratio filter
+    8. edge_glass_fraction + has_any_glass_edge per candidate
+    9. Pass 2: standalone always room; sub-room: any glass=keep, no glass=ignore
+    10. deduplicate (6% area + 90% overlap)
+    11. sort top-left → bottom-right
+    """
+
+    def node_snap_segs(segs, tol):
+        """v8 exact snap."""
+        out = []
         for ls in segs:
             try:
-                coords=[(round(x/tol)*tol,round(y/tol)*tol) for x,y in ls.coords]
-                d=[coords[0]]
+                coords = [(round(x/tol)*tol, round(y/tol)*tol) for x,y in ls.coords]
+                dedup  = [coords[0]]
                 for c in coords[1:]:
-                    if c!=d[-1]: d.append(c)
-                if len(d)>=2: out.append(LineString(d))
-            except: pass
+                    if c != dedup[-1]: dedup.append(c)
+                if len(dedup) >= 2:
+                    out.append(LineString(dedup))
+            except Exception: pass
         return out
 
     def bridge_gaps(lines, tol):
+        """v8 exact dangling-endpoint bridge."""
         from collections import defaultdict
-        ep=defaultdict(int)
+        ep = defaultdict(int)
         for ls in lines:
-            cs=list(ls.coords); ep[cs[0]]+=1; ep[cs[-1]]+=1
-        dangling=[pt for pt,cnt in ep.items() if cnt==1]
+            cs = list(ls.coords)
+            ep[cs[0]]  += 1
+            ep[cs[-1]] += 1
+        dangling = [pt for pt, cnt in ep.items() if cnt == 1]
         if not dangling: return []
-        bridges,used=[],set(); arr=np.array(dangling)
-        for i,pt in enumerate(dangling):
+        bridges, used = [], set()
+        arr = np.array(dangling)
+        for i, pt in enumerate(dangling):
             if i in used: continue
-            diffs=arr-np.array(pt); dists=np.hypot(diffs[:,0],diffs[:,1]); dists[i]=np.inf
-            j=int(np.argmin(dists))
-            if dists[j]<=tol and j not in used:
-                bridges.append(LineString([pt,dangling[j]])); used.add(i); used.add(j)
+            diffs = arr - np.array(pt)
+            dists = np.hypot(diffs[:,0], diffs[:,1])
+            dists[i] = np.inf
+            j = int(np.argmin(dists))
+            if dists[j] <= tol and j not in used:
+                bridges.append(LineString([pt, dangling[j]]))
+                used.add(i); used.add(j)
         return bridges
 
-    def compactness(p):
-        return 0 if p.length==0 else (4*math.pi*p.area)/(p.length**2)
-    def aspect_ratio(p):
-        mnx,mny,mxx,mxy=p.bounds; w=mxx-mnx; h=mxy-mny
-        return 999 if min(w,h)==0 else max(w,h)/min(w,h)
-    def is_outer(poly, all_p):
-        others=[p for p in all_p if p is not poly]
-        if not others: return False
-        return sum(1 for p in others if poly.contains(p.centroid))/len(others)>=0.35
+    # Step 1+2: snap separately, merge (v8 exact)
+    wall_snapped  = node_snap_segs(wall_segs,  snap_tol)
+    glass_snapped = node_snap_segs(glass_segs, snap_tol)
+    arc_snapped   = node_snap_segs(arc_segs,   snap_tol)
+    boundary_snapped = wall_snapped + glass_snapped + arc_snapped
 
-    wall_ls=[LineString(l) for l in raw_wall_lines]
-    wall_sn=node_snap(wall_ls,snap_tol); glass_sn=node_snap(raw_glass_segs,snap_tol)
-    glass_union=unary_union(glass_sn) if glass_sn else None
-    boundary=wall_sn+glass_sn; bridges=bridge_gaps(boundary,bridge_tol)
-    merged=unary_union(boundary+bridges); all_poly=list(polygonize(merged))
-    all_poly.sort(key=lambda p:p.area,reverse=True)
+    # Step 3: bridge dangling endpoints (v8 exact)
+    bridges = bridge_gaps(boundary_snapped, bridge_tol)
+    lines_for_poly = boundary_snapped + bridges
 
-    outer_ids=set()
-    for p in all_poly[:5]:
-        if is_outer(p,all_poly): outer_ids.add(id(p)); break
+    if show_debug:
+        st.info(f"[Mode A] Gap bridges: **{len(bridges)}**")
 
-    candidates=[]
-    for p in all_poly:
-        if id(p) in outer_ids: continue
-        a=p.area/unit_factor
-        if a<min_area_m2 or a>max_area_m2: continue
-        if compactness(p)<min_compact or aspect_ratio(p)>max_aspect_ratio: continue
-        gf=edge_glass_fraction(p,glass_union,snap_tol,glass_proximity_mult)
-        hg=has_any_glass_edge(p,glass_union,snap_tol,glass_proximity_mult)
-        candidates.append((p,gf,hg))
+    # Step 4: polygonize (v8 exact)
+    merged   = unary_union(lines_for_poly)
+    all_poly = list(polygonize(merged))
+    all_poly.sort(key=lambda p: p.area, reverse=True)
 
-    candidates.sort(key=lambda x:x[0].area,reverse=True)
-    accepted=[]
-    for (p,gf,hg) in candidates:
-        parent=None
-        for (ap,ag,ai) in accepted:
-            try:
-                if p.intersection(ap).area/p.area>=0.9: parent=(ap,ag,ai); break
-            except: pass
-        if parent is None: accepted.append((p,gf,gf>=glass_edge_thresh))
-        elif hg: accepted.append((p,gf,True))
+    if show_debug:
+        st.info(f"[Mode A] Raw polygons: **{len(all_poly)}**")
 
-    # deduplicate
-    keep=list(accepted); flags=[False]*len(keep)
-    for i in range(len(keep)):
+    # Step 5: glass_union from SNAPPED GLASS ONLY (v8 exact — NOT arc geometry)
+    glass_union = unary_union(glass_snapped) if glass_snapped else None
+
+    # Step 6: outer envelope exclusion — v8 exact: check [:5], threshold=0.35
+    outer_ids = set()
+    for poly in all_poly[:5]:
+        if is_outer_envelope(poly, all_poly, threshold=0.35):
+            outer_ids.add(id(poly))
+            if show_debug:
+                st.info(f"🏛️ Outer envelope ({poly.area/unit_factor:.1f} m²) → excluded")
+            break
+
+    # Step 7+8: Pass 1 filter (v8 exact — area, compactness, aspect, glass)
+    candidates = []
+    for poly in all_poly:
+        if id(poly) in outer_ids: continue
+        area_m2 = poly.area / unit_factor
+        if area_m2 < min_area_m2 or area_m2 > max_area_m2: continue
+        if compactness(poly)  < min_compact:  continue
+        if aspect_ratio(poly) > max_aspect:   continue
+        gf      = edge_glass_fraction(poly, glass_union, snap_tol, glass_proximity_mult)
+        has_gls = has_any_glass_edge(poly,    glass_union, snap_tol, glass_proximity_mult)
+        candidates.append((poly, gf, has_gls))
+
+    if show_debug:
+        st.info(f"[Mode A] Candidates after shape filter: **{len(candidates)}**")
+
+    candidates.sort(key=lambda x: x[0].area, reverse=True)
+
+    # Step 9: Pass 2 — parent/sub-room classification (v8 exact)
+    def is_mostly_inside(small, large, tol=0.90):
+        try:   return small.intersection(large).area / small.area >= tol
+        except: return False
+
+    accepted = []
+    for (poly, gf, has_gls) in candidates:
+        parent = next(((ap,ag,ai) for ap,ag,ai in accepted
+                       if is_mostly_inside(poly, ap)), None)
+        if parent is None:
+            # Standalone: always a room. Glass label by fraction.
+            is_glass_room = gf >= glass_edge_thresh
+            accepted.append((poly, gf, is_glass_room))
+        else:
+            # Sub-polygon inside parent (v8 fix):
+            # any glass edge → separate glass-partition room
+            # zero glass → furniture/column → silently ignored
+            if has_gls:
+                accepted.append((poly, gf, True))
+
+    # Step 10: deduplicate (v8 exact — 6% area, 90% overlap)
+    flags = [False] * len(accepted)
+    for i in range(len(accepted)):
         if flags[i]: continue
-        for j in range(i+1,len(keep)):
+        for j in range(i+1, len(accepted)):
             if flags[j]: continue
-            a,b=keep[i][0],keep[j][0]
-            if abs(a.area-b.area)/max(a.area,b.area)>0.06: continue
+            ap, bp = accepted[i][0], accepted[j][0]
+            if abs(ap.area-bp.area)/max(ap.area,bp.area) > 0.06: continue
             try:
-                if a.intersection(b).area/min(a.area,b.area)>=0.90: flags[j]=True
-            except: pass
-    accepted=[r for r,f in zip(keep,flags) if not f]
-    accepted.sort(key=lambda r:(-r[0].centroid.y,r[0].centroid.x))
-    return accepted, bridges
+                if ap.intersection(bp).area / min(ap.area,bp.area) >= 0.90:
+                    flags[j] = True
+            except Exception: pass
+    accepted = [r for r,f in zip(accepted,flags) if not f]
 
-# ══════════════════════════════════════════════════════
-#  MODE B ENGINE
-# ══════════════════════════════════════════════════════
+    # Step 11: sort top-left → bottom-right (v8 exact)
+    accepted.sort(key=lambda r: (-r[0].centroid.y, r[0].centroid.x))
+
+    n_gl = sum(1 for _,_,ig in accepted if ig)
+    n_wl = len(accepted) - n_gl
+    if show_debug:
+        st.success(f"[Mode A] Final rooms: **{len(accepted)}**  ({n_wl} wall + {n_gl} glass)")
+
+    return accepted, bridges, wall_snapped, glass_snapped
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MODE B — v11 engine (unchanged)
+# ──────────────────────────────────────────────────────────────────────────────
 def detect_rooms_mode_b(raw_wall_lines, extracted_objects,
                          gap_close_tol, max_door_width, min_wall_len,
                          min_area_m2, max_area_m2, unit_factor,
-                         outer_area_pct, exclude_stairs,
-                         stair_parallel_min, stair_angle_tol,
-                         max_stair_area_m2, min_solidity,
-                         max_aspect_ratio, max_interior_walls,
-                         min_closet_area_m2=0.3):
-    if not raw_wall_lines: return [],[]
-    shapely_walls=[LineString(l) for l in raw_wall_lines if LineString(l).length>=min_wall_len]
-    if not shapely_walls: return [],[]
-
-    merged_walls=unary_union(shapely_walls)
-    lines_list=(list(merged_walls.geoms) if merged_walls.geom_type=="MultiLineString"
-                else [merged_walls] if merged_walls.geom_type=="LineString"
-                else [g for g in merged_walls.geoms if g.geom_type=="LineString"])
-
-    eps=[]
+                         outer_area_pct=25.0, exclude_stairs=True,
+                         stair_parallel_min=4, stair_angle_tol=8.0,
+                         max_stair_area_m2=20.0, min_solidity=0.50,
+                         max_aspect_ratio=15.0, max_interior_walls=8,
+                         min_closet_area_m2=0.3, show_debug=False):
+    if not raw_wall_lines: return [], []
+    shapely_walls = [LineString(l) for l in raw_wall_lines
+                     if LineString(l).length >= min_wall_len]
+    if not shapely_walls: return [], []
+    merged_walls = unary_union(shapely_walls)
+    lines_list   = (list(merged_walls.geoms)
+                    if merged_walls.geom_type=='MultiLineString'
+                    else [merged_walls] if merged_walls.geom_type=='LineString'
+                    else [g for g in merged_walls.geoms if g.geom_type=='LineString'])
+    valid_endpoints = []
     for line in lines_list:
-        if line.length>min_wall_len:
-            eps.append(Point(line.coords[0])); eps.append(Point(line.coords[-1]))
-
-    bridges=[]
-    for i,e1 in enumerate(eps):
-        for j,e2 in enumerate(eps):
-            if i<j and e1.distance(e2)<=gap_close_tol:
-                bridges.append(LineString([e1,e2]))
-    for i,e1 in enumerate(eps):
-        for j,e2 in enumerate(eps):
+        if line.length > min_wall_len:
+            valid_endpoints.append(Point(line.coords[0]))
+            valid_endpoints.append(Point(line.coords[-1]))
+    if show_debug: st.info(f"[Mode B] Valid endpoints: **{len(valid_endpoints)}**")
+    bridges = []
+    for i,ep1 in enumerate(valid_endpoints):
+        for j,ep2 in enumerate(valid_endpoints):
+            if i<j and ep1.distance(ep2)<=gap_close_tol:
+                bridges.append(LineString([ep1,ep2]))
+    for i,ep1 in enumerate(valid_endpoints):
+        for j,ep2 in enumerate(valid_endpoints):
             if i<j:
-                d=e1.distance(e2)
-                if gap_close_tol<d<=max_door_width:
-                    dx=abs(e1.x-e2.x); dy=abs(e1.y-e2.y)
+                dist=ep1.distance(ep2)
+                if gap_close_tol<dist<=max_door_width:
+                    dx=abs(ep1.x-ep2.x); dy=abs(ep1.y-ep2.y)
                     if dx<150 or dy<150:
-                        br=LineString([e1,e2])
-                        if not br.crosses(merged_walls): bridges.append(br)
-
+                        br=LineString([ep1,ep2])
+                        if not br.crosses(merged_walls):
+                            bridges.append(br)
+    if show_debug: st.info(f"[Mode B] Bridges: **{len(bridges)}**")
     noded=unary_union(lines_list+bridges)
-    raw_polys=list(polygonize(noded)); raw_polys.sort(key=lambda p:p.area,reverse=True)
+    raw_polys=list(polygonize(noded))
+    raw_polys.sort(key=lambda p:p.area,reverse=True)
+    if show_debug: st.info(f"[Mode B] Raw polygons: **{len(raw_polys)}**")
     if not raw_polys: return [],[]
-
     mnx,mny,mxx,mxy=noded.bounds
-    outer_thresh=(mxx-mnx)*(mxy-mny)*(outer_area_pct/100.0)
-    min_mm2=min_area_m2*unit_factor; max_mm2=max_area_m2*unit_factor
-    min_cl=min_closet_area_m2*unit_factor; max_st=max_stair_area_m2*unit_factor
-
-    def is_staircase(poly,wsegs,mn,atol):
+    total_bbox=(mxx-mnx)*(mxy-mny)
+    outer_thresh=total_bbox*(outer_area_pct/100.0)
+    min_area_mm2=min_area_m2*unit_factor; max_area_mm2=max_area_m2*unit_factor
+    min_closet_mm2=min_closet_area_m2*unit_factor; max_stair_mm2=max_stair_area_m2*unit_factor
+    def is_staircase(poly,wsegs,min_p,atol):
         try:
             angles=[]
             for seg in wsegs:
-                mid=Point((seg.coords[0][0]+seg.coords[-1][0])/2,
-                           (seg.coords[0][1]+seg.coords[-1][1])/2)
+                mid=Point((seg.coords[0][0]+seg.coords[-1][0])/2,(seg.coords[0][1]+seg.coords[-1][1])/2)
                 if poly.contains(mid):
                     dx=seg.coords[-1][0]-seg.coords[0][0]; dy=seg.coords[-1][1]-seg.coords[0][1]
                     angles.append(math.degrees(math.atan2(dy,dx))%180)
-            if len(angles)<mn: return False
+            if len(angles)<min_p: return False
             angles.sort()
             for ref in angles:
-                if sum(1 for a in angles if abs(a-ref)<=atol or abs(a-ref)>=(180-atol))>=mn:
-                    return True
-        except: pass
+                if sum(1 for a in angles if abs(a-ref)<=atol or abs(a-ref)>=(180-atol))>=min_p: return True
+        except Exception: pass
         return False
-
     rooms_data=[]; wall_cavities=[]
     for poly in raw_polys:
         area=poly.area
-        if area>=outer_thresh: continue
-        if area<min_mm2 or area>max_mm2:
-            if min_cl<=area<min_mm2:
+        if area>=outer_thresh:
+            if show_debug: st.info(f"🏛️ [Mode B] Outer excluded: {area/unit_factor:.1f} m²")
+            continue
+        if area<min_area_mm2 or area>max_area_mm2:
+            if min_closet_mm2<=area<min_area_mm2:
                 buf=poly.buffer(50)
                 for obj in extracted_objects:
-                    if buf.covers(obj["point"]):
+                    if buf.covers(obj['point']):
                         rooms_data.append({"width":round(poly.bounds[2]-poly.bounds[0],2),
                             "height":round(poly.bounds[3]-poly.bounds[1],2),
                             "area":round(area,2),"polygon":poly,"objects_inside":[]}); break
-            elif 10000<area<min_cl: wall_cavities.append(poly)
+            elif 10000<area<min_closet_mm2: wall_cavities.append(poly)
             continue
         try: hull=poly.convex_hull; solid=area/hull.area if hull.area>0 else 0
         except: solid=1.0
-        if solid<min_solidity: continue
+        if solid<min_solidity:
+            if show_debug: st.info(f"⛔ [Mode B] Low solidity ({solid:.2f}): {area/unit_factor:.1f}m²")
+            continue
         rmx,rmy,rMx,rMy=poly.bounds; w=rMx-rmx; h=rMy-rmy
         ar=max(w,h)/max(min(w,h),1)
-        if ar>max_aspect_ratio: continue
-        if exclude_stairs and area<=max_st:
-            if is_staircase(poly,shapely_walls,stair_parallel_min,stair_angle_tol): continue
-        interior=sum(1 for seg in shapely_walls
+        if ar>max_aspect_ratio:
+            if show_debug: st.info(f"⛔ [Mode B] High aspect ({ar:.1f}): {area/unit_factor:.1f}m²")
+            continue
+        if exclude_stairs and area<=max_stair_mm2:
+            if is_staircase(poly,shapely_walls,stair_parallel_min,stair_angle_tol):
+                if show_debug: st.info(f"🪜 [Mode B] Stair excluded: {area/unit_factor:.1f}m²")
+                continue
+        piercing=sum(1 for seg in shapely_walls
             if poly.contains(Point(seg.coords[0])) and poly.contains(Point(seg.coords[-1])))
-        if interior>max_interior_walls: continue
+        if piercing>max_interior_walls:
+            if show_debug: st.info(f"⛔ [Mode B] Wall-pierced ({piercing}): {area/unit_factor:.1f}m²")
+            continue
         rooms_data.append({"width":round(w,2),"height":round(h,2),
-                           "area":round(area,2),"polygon":poly,"objects_inside":[]})
-
+                            "area":round(area,2),"polygon":poly,"objects_inside":[]})
     clean=[]
     for i,room in enumerate(rooms_data):
         bad=False
         for j,other in enumerate(rooms_data):
             if i==j: continue
             try:
-                if other["polygon"].contains(room["polygon"].representative_point()): bad=True; break
-                inter=room["polygon"].intersection(other["polygon"])
-                if inter.area>0.8*room["area"] and room["area"]<other["area"]: bad=True; break
-            except: pass
+                if other['polygon'].contains(room['polygon'].representative_point()): bad=True; break
+                inter=room['polygon'].intersection(other['polygon'])
+                if inter.area>0.80*room['area'] and room['area']<other['area']: bad=True; break
+            except Exception: pass
         if not bad: clean.append(room)
-    clean.sort(key=lambda x:x["area"],reverse=True)
-    for idx,r in enumerate(clean): r["name"]=f"Room {idx+1}"; r["room_id"]=f"R{idx+1}"
+    clean.sort(key=lambda x:x['area'],reverse=True)
+    for idx,room in enumerate(clean): room['name']=f"Room {idx+1}"; room['room_id']=f"R{idx+1}"
     return clean, wall_cavities
 
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  RUN DETECTION
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 with st.spinner("🔲 Detecting rooms…"):
     if USE_GLASS_MODE:
-        accepted, bridges_used = detect_rooms_mode_a(
-            raw_wall_lines, raw_glass_segs,
-            snap_tol_a, bridge_tol_a,
-            glass_edge_thresh, glass_proximity_mult,
-            min_area_m2, max_area_m2, unit_factor,
-            min_compact_a, max_aspect_a)
-        wall_cavities=[]
-        rooms_unified=[]
-        for i,(poly,gf,is_glass) in enumerate(accepted):
-            mnx,mny,mxx,mxy=poly.bounds
+        accepted, bridges_used, wall_sn, glass_sn = detect_rooms_mode_a(
+            wall_segs=wall_segs, glass_segs=glass_segs, arc_segs=arc_segs,
+            snap_tol=snap_tol, bridge_tol=bridge_tol,
+            glass_edge_thresh=glass_edge_thresh,
+            glass_proximity_mult=glass_proximity_mult,
+            min_area_m2=min_area_m2, max_area_m2=max_area_m2,
+            min_compact=min_compact, max_aspect=max_aspect_a,
+            unit_factor=unit_factor, show_debug=show_debug)
+        wall_cavities = []
+        rooms_unified = []
+        for i, (poly, gf, is_glass) in enumerate(accepted):
+            minx,miny,maxx,maxy=poly.bounds
             rooms_unified.append({"name":f"Room {i+1}","room_id":f"R{i+1}",
                 "polygon":poly,"gf":gf,"is_glass":is_glass,
-                "width":mxx-mnx,"height":mxy-mny,"area":poly.area,"objects_inside":[]})
+                "width":maxx-minx,"height":maxy-miny,
+                "area":poly.area,"objects_inside":[]})
     else:
         room_list, wall_cavities = detect_rooms_mode_b(
-            raw_wall_lines, extracted_objects,
-            gap_close_tol, max_door_width, min_wall_len,
-            min_area_m2, max_area_m2, unit_factor,
-            outer_area_pct, exclude_stairs,
-            int(stair_parallel_min), float(stair_angle_tol),
-            float(max_stair_area_m2), float(min_solidity),
-            float(max_aspect), int(max_interior_walls))
-        bridges_used=[]
+            raw_wall_lines=raw_wall_lines, extracted_objects=extracted_objects,
+            gap_close_tol=gap_close_tol, max_door_width=max_door_width,
+            min_wall_len=min_wall_len, min_area_m2=min_area_m2,
+            max_area_m2=max_area_m2, unit_factor=unit_factor,
+            outer_area_pct=outer_area_pct_b, exclude_stairs=exclude_stairs,
+            stair_parallel_min=int(stair_parallel_min),
+            stair_angle_tol=float(stair_angle_tol),
+            max_stair_area_m2=float(max_stair_area_m2),
+            min_solidity=float(min_solidity),
+            max_aspect_ratio=float(max_aspect_b),
+            max_interior_walls=int(max_interior_walls),
+            show_debug=show_debug)
+        bridges_used=[]; wall_sn=[]; glass_sn=[]
         rooms_unified=[]
         for r in room_list:
-            rooms_unified.append({"name":r["name"],"room_id":r["room_id"],
-                "polygon":r["polygon"],"gf":0.0,"is_glass":False,
-                "width":r["width"],"height":r["height"],
-                "area":r["area"],"objects_inside":r["objects_inside"]})
+            rooms_unified.append({"name":r['name'],"room_id":r['room_id'],
+                "polygon":r['polygon'],"gf":0.0,"is_glass":False,
+                "width":r['width'],"height":r['height'],
+                "area":r['area'],"objects_inside":r['objects_inside']})
 
 for room in rooms_unified:
-    buf=room["polygon"].buffer(10)
+    poly_buf=room['polygon'].buffer(10)
     for obj in extracted_objects:
-        if buf.covers(obj["point"]): room["objects_inside"].append(obj["object_id"])
+        if poly_buf.covers(obj['point']):
+            room['objects_inside'].append(obj['object_id'])
 
 n_rooms=len(rooms_unified)
-n_glass=sum(1 for r in rooms_unified if r.get("is_glass"))
+n_glass=sum(1 for r in rooms_unified if r.get('is_glass'))
 n_wall=n_rooms-n_glass
 
 if not rooms_unified:
-    st.error("❌ No rooms found. Check that the correct wall layers are selected above.")
+    st.error("❌ No rooms found.\nTry: ↑ Bridge tol | ↓ Min Area | ↓ Min Compactness | Check layers")
     fig0,ax0=plt.subplots(figsize=(14,7))
     fig0.patch.set_facecolor("#0f1117"); ax0.set_facecolor("#0f1117")
-    for l in raw_wall_lines[:5000]:
-        ax0.plot([l[0][0],l[1][0]],[l[0][1],l[1][1]],color="#00d4ff",lw=0.5,alpha=0.5)
-    ax0.set_aspect("equal"); ax0.set_title("Raw wall geometry — no rooms found",color="white")
+    draw_segs=wall_sn if USE_GLASS_MODE else [LineString(l) for l in raw_wall_lines[:5000]]
+    for ls in draw_segs[:5000]:
+        xs,ys=ls.xy; ax0.plot(xs,ys,color="#00d4ff",lw=0.5,alpha=0.5)
+    ax0.set_aspect("equal"); ax0.set_title("Raw geometry — no rooms found",color="white")
     st.pyplot(fig0); plt.close(); st.stop()
 
-st.success(f"✅ **{n_rooms} rooms** detected  "
-           f"({n_glass} glass-bounded + {n_wall} wall-bounded)")
+st.success(f"✅ **{n_rooms} rooms** ({n_glass} glass + {n_wall} wall)  |  {mode_label}")
 
-# ══════════════════════════════════════════════════════
-#  HEAT LOAD CALC
-# ══════════════════════════════════════════════════════
-COLORS=["#FF6B6B","#4ECDC4","#45B7D1","#96CEB4","#FFEAA7","#DDA0DD","#98D8C8",
-        "#F7DC6F","#82E0AA","#F1948A","#85C1E9","#F0B27A","#C39BD3","#76D7C4",
-        "#F9E79F","#AED6F1","#A9DFBF","#FAD7A0","#D2B4DE","#FFB3BA"]
+# ──────────────────────────────────────────────────────────────────────────────
+#  HEAT LOAD
+# ──────────────────────────────────────────────────────────────────────────────
+COLORS=["#FF6B6B","#4ECDC4","#45B7D1","#96CEB4","#FFEAA7","#DDA0DD",
+        "#98D8C8","#F7DC6F","#82E0AA","#F1948A","#85C1E9","#F0B27A",
+        "#C39BD3","#76D7C4","#F9E79F","#AED6F1","#A9DFBF","#FAD7A0",
+        "#D2B4DE","#FFB3BA"]
 
 room_data=[]
 for i,room in enumerate(rooms_unified):
-    poly=room["polygon"]; gf=room.get("gf",0.0); is_glass=room.get("is_glass",False)
+    poly=room['polygon']; gf=room.get('gf',0.0); is_glass=room.get('is_glass',False)
     area_m2=poly.area/unit_factor; perim_m=poly.length/unit_div
-    mnx,mny,mxx,mxy=poly.bounds
-    length_m=(mxx-mnx)/unit_div; breadth_m=(mxy-mny)/unit_div
-    gp=perim_m*gf; wp=perim_m*(1-gf); wa=wp*H; ga=gp*H
-    q_w=wa*U_wall*DT; q_g=ga*U_glass*DT; q_p=people_per_room*Q_person
-    q_tot=q_w+q_g+q_p; tr=q_tot/3517
+    minx,miny,maxx,maxy=poly.bounds
+    length_m=(maxx-minx)/unit_div; breadth_m=(maxy-miny)/unit_div
+    glass_p_m=perim_m*gf; wall_p_m=perim_m*(1-gf)
+    wall_a_m2=wall_p_m*H; glass_a_m2=glass_p_m*H
+    q_wall=wall_a_m2*U_wall*DT; q_glass=glass_a_m2*U_glass*DT
+    q_people=people_per_room*Q_person; q_total=q_wall+q_glass+q_people
+    tr=q_total/3517
     room_data.append({
-        "Room":room["name"],
-        "Type":"🔵 Glass" if is_glass else "🟩 Wall",
-        "Area (m²)":round(area_m2,3),
-        "Perimeter (m)":round(perim_m,3),
-        "Length (m)":round(length_m,2),
-        "Breadth (m)":round(breadth_m,2),
+        "Room":f"Room {i+1}", "Type":"🔵 Glass" if is_glass else "🟩 Wall",
+        "Area (m²)":round(area_m2,3), "Perimeter (m)":round(perim_m,3),
+        "Length ref (m)":round(length_m,2), "Breadth ref (m)":round(breadth_m,2),
         "Glass % edge":round(gf*100,1),
-        "Wall Area (m²)":round(wa,3),
-        "Glass Area (m²)":round(ga,3),
-        "Q_wall (W)":round(q_w,1),
-        "Q_glass (W)":round(q_g,1),
-        "Q_people (W)":round(q_p,1),
-        "Q_total (W)":round(q_tot,1),
-        "TR":round(tr,3),
-        "Objects":", ".join(room.get("objects_inside",[])) or "—",
+        "Wall Area (m²)":round(wall_a_m2,3), "Glass Area (m²)":round(glass_a_m2,3),
+        "Q_wall (W)":round(q_wall,1), "Q_glass (W)":round(q_glass,1),
+        "Q_people (W)":round(q_people,1), "Q_total (W)":round(q_total,1),
+        "TR":round(tr,3), "Objects":", ".join(room.get('objects_inside',[]))or"—",
         "_poly":poly,"_gf":gf,"_is_glass":is_glass,
-        "_color":"#00d4ff" if is_glass else COLORS[i%len(COLORS)],
-    })
+        "_color":"#00d4ff" if is_glass else COLORS[i%len(COLORS)]})
 
 df=pd.DataFrame(room_data)
 display_cols=[c for c in df.columns if not c.startswith("_")]
 
-# ══════════════════════════════════════════════════════
-#  FLOOR PLAN
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  FLOOR PLAN  (v8 exact visual style)
+# ──────────────────────────────────────────────────────────────────────────────
 st.subheader("🗺️ Detected Floor Plan")
 fig,ax=plt.subplots(figsize=(20,11))
 fig.patch.set_facecolor("#0f1117"); ax.set_facecolor("#0f1117")
 ax.tick_params(colors="#888")
 for sp in ax.spines.values(): sp.set_edgecolor("#333")
 
-for l in raw_wall_lines[:8000]:
-    ax.plot([l[0][0],l[1][0]],[l[0][1],l[1][1]],color="#3a6a8a",lw=0.6,alpha=0.5,zorder=1)
-for l in raw_glass_lines:
-    ax.plot([l[0][0],l[1][0]],[l[0][1],l[1][1]],color="#00d4ff",lw=1.4,alpha=0.75,zorder=2)
+if show_raw:
+    for ls in all_segs_display[:8000]:
+        xs,ys=ls.xy; ax.plot(xs,ys,color="#1e3a50",lw=0.25,alpha=0.35)
+
+if USE_GLASS_MODE:
+    for ls in wall_sn:
+        xs,ys=ls.xy; ax.plot(xs,ys,color="#3a6a8a",lw=0.6,alpha=0.5,zorder=1)
+    for ls in glass_sn:
+        xs,ys=ls.xy; ax.plot(xs,ys,color="#00d4ff",lw=1.4,alpha=0.75,zorder=2)
+else:
+    for l in raw_wall_lines[:8000]:
+        ax.plot([l[0][0],l[1][0]],[l[0][1],l[1][1]],color="#3a6a8a",lw=0.6,alpha=0.5,zorder=1)
+
 for br in bridges_used:
-    xs,ys=br.xy; ax.plot(xs,ys,color="#ff4444",lw=0.8,ls="--",alpha=0.6,zorder=2)
+    xs,ys=br.xy; ax.plot(xs,ys,color="#ff4444",lw=1.0,ls="--",alpha=0.7,zorder=2)
 for cav in wall_cavities:
-    if cav.geom_type=="Polygon":
+    if cav.geom_type=='Polygon':
         xs,ys=cav.exterior.xy; ax.fill(xs,ys,color="dimgray",alpha=0.8,zorder=2)
 
 for row in room_data:
     poly=row["_poly"]; color=row["_color"]; ig=row["_is_glass"]; gf=row["_gf"]
     xs,ys=poly.exterior.xy
-    ax.fill(xs,ys,alpha=0.38 if ig else 0.22,color=color,zorder=3)
+    ax.fill(xs,ys,alpha=0.40 if ig else 0.22,color=color,zorder=3)
     ax.plot(xs,ys,color="#00d4ff" if ig else color,lw=2.5 if ig else 1.6,zorder=4)
     cx,cy=poly.centroid.x,poly.centroid.y
     label=f"{'🔵' if ig else '🟩'} {row['Room']}\n{row['Area (m²)']} m²\nTR:{row['TR']}"
     if gf>0.05: label+=f"\n{row['Glass % edge']}% glass"
-    ax.text(cx,cy,label,ha="center",va="center",fontsize=6.5,color="white",
-            fontfamily="monospace",zorder=5,
+    ax.text(cx,cy,label,ha="center",va="center",fontsize=6.5,
+            color="white",fontfamily="monospace",zorder=5,
             bbox=dict(boxstyle="round,pad=0.28",facecolor="#000000dd",
                       edgecolor="#00d4ff" if ig else color,
                       linewidth=1.3 if ig else 0.5))
-
 for obj in extracted_objects:
-    ax.plot(obj["center_x"],obj["center_y"],"ro",markersize=4,zorder=6)
+    ax.plot(obj['center_x'],obj['center_y'],'ro',markersize=4,zorder=6)
 
 ax.set_aspect("equal")
-ax.set_title(f"Floor Plan — {n_rooms} rooms ({n_wall} wall + {n_glass} glass)  |  {mode_label}",
-             color="#00d4ff",fontfamily="monospace",fontsize=10)
+ax.set_title(f"Floor Plan — {n_rooms} rooms ({n_wall} wall + {n_glass} glass)  |  {mode_label}  ",
+    color="#00d4ff",fontfamily="monospace",fontsize=10)
 ax.grid(True,color="#1a2a3a",lw=0.25)
 legend_items=[mpatches.Patch(color="#3a6a8a",label="Wall lines"),
               mpatches.Patch(color="#ff4444",label=f"Bridges ({len(bridges_used)})")]
 if USE_GLASS_MODE:
-    legend_items.append(mpatches.Patch(color="#00d4ff",label="Glass lines"))
+    legend_items+=[mpatches.Patch(color="#00d4ff",label="Glass lines"),
+                   mpatches.Patch(color="#00d4ff",alpha=0.4,label="Glass room fill")]
 ax.legend(handles=legend_items,loc="upper right",
           facecolor="#0f1117",edgecolor="#444",labelcolor="white",fontsize=9)
 st.pyplot(fig); plt.close()
 
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  TABLE
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 st.subheader("📊 Room Measurements & Heat Load")
-st.caption("Area and Perimeter = actual polygon geometry")
-st.dataframe(
-    df[display_cols].style
-      .format({"TR":"{:.3f}","Area (m²)":"{:.3f}","Perimeter (m)":"{:.3f}",
-               "Q_total (W)":"{:.1f}","Glass % edge":"{:.1f}"}),
+st.caption("✅ Area and Perimeter = actual polygon geometry (not bounding box)")
+st.dataframe(df[display_cols].style
+    .format({"TR":"{:.3f}","Area (m²)":"{:.3f}","Perimeter (m)":"{:.3f}",
+             "Q_total (W)":"{:.1f}","Glass % edge":"{:.1f}"}),
     use_container_width=True)
 
-# ══════════════════════════════════════════════════════
-#  SUMMARY METRICS
-# ══════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  METRICS
+# ──────────────────────────────────────────────────────────────────────────────
 st.subheader("🌡️ Heat Load Summary")
 total_area=df["Area (m²)"].sum(); total_kw=df["Q_total (W)"].sum()/1000; total_tr=df["TR"].sum()
 c1,c2,c3,c4,c5=st.columns(5)
-c1.metric("🏠 Total Rooms",   n_rooms)
-c2.metric("🔵 Glass Rooms",   n_glass)
-c3.metric("📐 Total Area",   f"{total_area:.2f} m²")
-c4.metric("⚡ Total Load",   f"{total_kw:.2f} kW")
-c5.metric("❄️ Total TR",     f"{total_tr:.2f} TR")
+c1.metric("🏠 Total Rooms",n_rooms); c2.metric("🔵 Glass Rooms",n_glass)
+c3.metric("📐 Total Area",f"{total_area:.2f} m²")
+c4.metric("⚡ Total Load",f"{total_kw:.2f} kW"); c5.metric("❄️ Total TR",f"{total_tr:.2f} TR")
+
+
+st.download_button("⬇️ Download CSV",df[display_cols].to_csv(index=False),
+                   "rooms_heat_load.csv","text/csv")
+st.divider()
+st.caption(
+    f"  {mode_label} | Wall:{','.join(sorted(WALL_LAYERS))} | "
+    f"Glass:{','.join(sorted(GLASS_LAYERS))or'none'} | "
+    f"{n_rooms} rooms ({n_glass} glass) | {total_tr:.2f} TR"
+    +(f" | snap={snap_tol} bridge={bridge_tol} compact={min_compact} "
+       f"aspect={max_aspect_a} prox×{glass_proximity_mult} thresh={glass_edge_thresh}"
+       if USE_GLASS_MODE
+       else f" | gap={gap_close_tol} door={max_door_width} "
+            f"solid={min_solidity} aspect={max_aspect_b}"))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
