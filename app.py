@@ -494,9 +494,9 @@ def render_floorplan_figure(room_data, raw_wall_lines, USE_GLASS_MODE,
         cx, cy = poly.centroid.x, poly.centroid.y
         raw_name     = ai_name if ai_type != "Other" else row["Room"]
         display_name = re.sub(r'[^\x00-\x7F\s\-/().,:]', '', raw_name).strip() or raw_name
-        label = f"{display_name}\n{row['Area (m2)']} m2\nTR:{row['TR']} CFM:{row['CFM']}"
+        label = f"{display_name}\n Area:{row['Area (m2)']}"
         if gf > 0.05:
-            label += f"\n{row['Glass % edge']}% glass"
+            label += f""
         ax.text(cx, cy, label, ha="center", va="center", fontsize=6.5,
                 color="white", fontfamily="monospace", zorder=5,
                 bbox=dict(boxstyle="round,pad=0.28", facecolor="#000000dd",
@@ -1019,9 +1019,7 @@ else:
 
         st.markdown("#### 📋 Room-wise Breakdown")
         filt_df  = pd.DataFrame(filtered_rows)
-        tbl_cols = ["Room", "AI Type", "Area (m2)", "TR", "CFM",
-                    "Q_wall (W)", "Q_glass (W)", "Q_people (W)", "Q_total (W)",
-                    "Glass % edge"]
+        tbl_cols = ["Room", "AI Type", "Area (m2)", "TR", "CFM"]
         tbl_cols = [c for c in tbl_cols if c in filt_df.columns]
         st.dataframe(
             filt_df[tbl_cols].style.format({
