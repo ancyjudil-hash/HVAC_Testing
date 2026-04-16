@@ -1,19 +1,16 @@
 """
-app.py — CAD Room Extractor + Heat Load + CFM Calculator  v19
-==============================================================
-v19 Changes:
-  - GATED FLOW: After upload, only Layer Selection is shown.
-    Everything else (floor plan, room table, selection, results)
-    is hidden until the user clicks "Show AI Floor Plan".
-  - "Calculate TR & CFM for ALL Rooms" button — one click selects
-    all rooms and immediately shows results. No checkboxes needed.
-  - Individual room selection via st.form — no rerun on checkbox click.
-  - Select All / Deselect All buttons correctly update checkbox defaults
-    because form_sel is read fresh on each rerun.
-  - Floor plan PNG download available below the floor plan image.
+app.py — CAD Room Extractor + Heat Load + CFM + Duct Layout  v20
+================================================================
+v20 Changes (on top of v19):
+  - NEW: Section ⑩ — Duct Layout Generation
+      * AHU auto-placed at centroid of selected rooms
+      * Branch ducts routed (rectilinear L-shape) from AHU to every room
+      * Duct sized via Equal Friction / SMACNA velocity method
+      * Floor plan rendered with duct overlay (colour-coded by duct size)
+      * Downloads: Duct Floor Plan PNG, DXF (CAD-ready), Sizing CSV, BOQ CSV
 
 Run:  streamlit run app.py
-Needs: geometry_engine.py  heat_load.py  (same folder)
+Needs: geometry_engine.py  heat_load.py  duct_engine.py  (same folder)
 """
 
 import subprocess, os, json, re, io, base64
@@ -495,8 +492,6 @@ def render_floorplan_figure(room_data, raw_wall_lines, USE_GLASS_MODE,
         raw_name     = ai_name if ai_type != "Other" else row["Room"]
         display_name = re.sub(r'[^\x00-\x7F\s\-/().,:]', '', raw_name).strip() or raw_name
         label = f"{display_name}\n Area:{row['Area (m2)']}"
-        if gf > 0.05:
-            label += f""
         ax.text(cx, cy, label, ha="center", va="center", fontsize=6.5,
                 color="white", fontfamily="monospace", zorder=5,
                 bbox=dict(boxstyle="round,pad=0.28", facecolor="#000000dd",
@@ -612,20 +607,21 @@ with st.sidebar:
     show_raw = st.checkbox("Show raw geometry overlay", value=False)
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SESSION STATE  (initialise once)
+#  SESSION STATE
 # ═════════════════════════════════════════════════════════════════════════════
 ss = st.session_state
 for key, default in [
-    ("show_floorplan", False),   # True after "Show AI Floor Plan" clicked
-    ("show_results",   False),   # True after "Calculate" clicked
-    ("conf_rooms",     []),      # list of selected room indices
-    ("form_sel",       {}),      # rid → bool, persisted checkbox state
+    ("show_floorplan", False),
+    ("show_results",   False),
+    ("conf_rooms",     []),
+    ("form_sel",       {}),
+    ("duct_result",    None),   # ← NEW: stores duct pipeline output
 ]:
     if key not in ss:
         ss[key] = default
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ① FILE UPLOAD  (always visible)
+#  ① FILE UPLOAD
 # ═════════════════════════════════════════════════════════════════════════════
 uploaded_file = st.file_uploader("📂 Upload DWG File", type=["dwg"])
 if not uploaded_file:
@@ -635,7 +631,6 @@ if not uploaded_file:
 dwg_bytes = uploaded_file.getvalue()
 dwg_name  = uploaded_file.name
 
-# ODA CONVERSION
 with st.spinner("🔄 Converting DWG → DXF…"):
     try:
         dxf_path = run_oda_conversion(dwg_bytes, dwg_name, oda_path)
@@ -643,7 +638,7 @@ with st.spinner("🔄 Converting DWG → DXF…"):
         st.error(str(e)); st.stop()
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ② LAYER SCAN + LAYER SELECTION  (always visible after upload)
+#  ② LAYER SCAN + LAYER SELECTION
 # ═════════════════════════════════════════════════════════════════════════════
 sorted_layers, layer_entity_count, all_layers_in_file = scan_dxf_layers(dxf_path)
 active_layers = [l for l in sorted_layers if layer_entity_count.get(l, 0) > 0]
@@ -693,8 +688,7 @@ with st.expander("🔍 Layer Selection", expanded=True):
         if sel_furn:  FURN_LAYERS  = {l.upper() for l in sel_furn}
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ③ "SHOW AI FLOOR PLAN" BUTTON
-#     Everything below this is hidden until the button is clicked.
+#  ③ SHOW AI FLOOR PLAN BUTTON
 # ═════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 fp_c1, fp_c2, fp_c3 = st.columns([2, 3, 2])
@@ -702,12 +696,11 @@ with fp_c2:
     if st.button("🗺️ Show AI Floor Plan", key="show_fp_btn",
                  type="primary", use_container_width=True):
         ss["show_floorplan"] = True
-        # Reset downstream state so a fresh file doesn't show stale results
         ss["show_results"] = False
         ss["conf_rooms"]   = []
         ss["form_sel"]     = {}
+        ss["duct_result"]  = None   # reset duct on new plan
 
-# ── GATE: stop here until the button has been clicked ─────────────────────
 if not ss["show_floorplan"]:
     st.markdown(
         "<p style='text-align:center;color:#556677;font-size:13px;margin-top:6px'>"
@@ -716,7 +709,7 @@ if not ss["show_floorplan"]:
     st.stop()
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ④ ROOM DETECTION  (runs only after button clicked)
+#  ④ ROOM DETECTION
 # ═════════════════════════════════════════════════════════════════════════════
 with st.spinner("🔲 Extracting geometry and detecting rooms…"):
     try:
@@ -895,13 +888,12 @@ st.markdown("## Room Selection & TR / CFM Calculation")
 all_room_ids = [r.get("_room_id", f"R{i}") for i, r in enumerate(room_data)]
 n_total      = len(room_data)
 
-# Ensure form_sel has an entry for every room
 for rid in all_room_ids:
     if rid not in ss["form_sel"]:
         ss["form_sel"][rid] = False
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STATE A — SELECTION  (shown when show_results is False)
+#  STATE A — SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
 if not ss["show_results"]:
 
@@ -911,8 +903,6 @@ if not ss["show_results"]:
         "or use the quick button to calculate all rooms at once.</p>",
         unsafe_allow_html=True)
 
-    # ── Quick "Calculate ALL Rooms" button ────────────────────────────────────
-    # This bypasses checkboxes entirely: select all → show results in one click.
     all_c1, all_c2, all_c3 = st.columns([2, 3, 2])
     with all_c2:
         if st.button(
@@ -921,8 +911,9 @@ if not ss["show_results"]:
             type="primary",
             use_container_width=True,
         ):
-            ss["conf_rooms"]   = list(range(n_total))   # every room
+            ss["conf_rooms"]   = list(range(n_total))
             ss["show_results"] = True
+            ss["duct_result"]  = None
             st.rerun()
 
     st.markdown(
@@ -930,9 +921,6 @@ if not ss["show_results"]:
         "margin:6px 0 16px 0'>— or select individual rooms below —</div>",
         unsafe_allow_html=True)
 
-
-
-    # ── Individual checkboxes inside a form (no rerun on each tick) ──────────
     st.markdown(
         "<div style='background:#0d1117;border:1px solid #1a2535;"
         "border-radius:10px;padding:16px 18px;margin-bottom:16px'>",
@@ -952,8 +940,6 @@ if not ss["show_results"]:
             tc       = ROOM_TYPE_COLOR.get(ai_type, "#556677")
             area     = row["Area (m2)"]
             with cols[i % 3]:
-                # value= reads from ss["form_sel"], so Select All / Deselect All
-                # take effect on the next rerun (which they trigger).
                 val = st.checkbox(
                     label=f"{ai_emoji} {row['Room']}",
                     value=ss["form_sel"].get(rid, False),
@@ -983,12 +969,13 @@ if not ss["show_results"]:
         if selected:
             ss["conf_rooms"]   = selected
             ss["show_results"] = True
+            ss["duct_result"]  = None
             st.rerun()
         else:
             st.warning("☝️ Tick at least one room above to calculate.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STATE B — RESULTS
+#  STATE B — RESULTS + DUCT LAYOUT
 # ══════════════════════════════════════════════════════════════════════════════
 else:
     confirmed_idx = ss["conf_rooms"]
@@ -1023,10 +1010,7 @@ else:
         tbl_cols = [c for c in tbl_cols if c in filt_df.columns]
         st.dataframe(
             filt_df[tbl_cols].style.format({
-                "TR": "{:.3f}", "CFM": "{:.1f}", "Area (m2)": "{:.2f}",
-                "Q_wall (W)": "{:.1f}", "Q_glass (W)": "{:.1f}",
-                "Q_people (W)": "{:.1f}", "Q_total (W)": "{:.1f}",
-                "Glass % edge": "{:.1f}"}),
+                "TR": "{:.3f}", "CFM": "{:.1f}", "Area (m2)": "{:.2f}"}),
             use_container_width=True,
             height=min(460, 65 + 35 * n_conf))
 
@@ -1057,22 +1041,154 @@ else:
                 df[ec_all].to_csv(index=False),
                 "rooms_all.csv", "text/csv", use_container_width=True)
 
+        # ═════════════════════════════════════════════════════════════════════
+        #  ⑩  DUCT LAYOUT SECTION  ← NEW in v20
+        # ═════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("## 🌬️ Duct Layout")
+        st.markdown(
+            "<p style='color:#8899aa;font-size:13px'>"
+            "AHU is auto-placed at the centroid of all selected rooms. "
+            "Branch ducts are routed (L-shaped) from AHU to each room centroid. "
+            "Sizing follows SMACNA Equal Friction method.</p>",
+            unsafe_allow_html=True)
+
+        dc1, dc2, dc3 = st.columns([2, 3, 2])
+        with dc2:
+            gen_duct = st.button(
+                "⚡ Generate Duct Layout",
+                key="gen_duct_btn",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if gen_duct:
+            with st.spinner("🔧 Routing ducts and sizing… (SMACNA Equal Friction)"):
+                from duct_engine import run_duct_pipeline
+                ss["duct_result"] = run_duct_pipeline(
+                    room_data=filtered_rows,
+                    unit_div=unit_div,
+                    raw_wall_lines=raw_wall_lines,
+                    use_glass_mode=USE_GLASS_MODE,
+                    wall_sn=wall_sn,
+                    glass_sn=glass_sn,
+                )
+
+        if ss["duct_result"]:
+            dr = ss["duct_result"]
+
+            # AHU placement info
+            ax_x, ax_y = dr["ahu_xy"]
+            ax_m = round(ax_x / unit_div, 1)
+            ay_m = round(ax_y / unit_div, 1)
+            st.info(
+                f"🏭 **AHU placed** at drawing coords ({ax_x:.0f}, {ax_y:.0f}) "
+                f"≈ **({ax_m} m, {ay_m} m)** — centroid of all selected rooms"
+            )
+
+            # Floor plan with duct overlay
+            st.subheader("Duct Layout — Floor Plan")
+            st.pyplot(dr["fig"])
+            plt.close(dr["fig"])
+
+            ddl1, ddl2, ddl3 = st.columns(3)
+            with ddl1:
+                st.download_button(
+                    "⬇️ Download Duct Floor Plan (PNG)",
+                    data=dr["png_bytes"],
+                    file_name="duct_layout.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
+            with ddl2:
+                st.download_button(
+                    "⬇️ Download DXF (CAD-ready)",
+                    data=dr["dxf_bytes"],
+                    file_name="duct_layout.dxf",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+
+            # Duct sizing table
+            st.markdown("---")
+            st.subheader("📐 Duct Sizing Table")
+            segs_df = pd.DataFrame([
+                {
+                    "Segment":       s["segment_id"],
+                    "Room":          s["room_name"],
+                    "CFM":           round(s.get("cfm", 0), 1),
+                    "Size W×H (mm)": s.get("label", ""),
+                    "Width (mm)":    s.get("width_mm", 0),
+                    "Height (mm)":   s.get("height_mm", 0),
+                    "Velocity (m/s)":s.get("velocity_ms", 0),
+                    "Equiv ⌀ (mm)":  s.get("equiv_diam_mm", 0),
+                    "Length (m)":    s.get("length_m", 0),
+                    "Type":          "Main Trunk" if s.get("is_main") else "Branch",
+                }
+                for s in dr["segments"]
+            ])
+            st.dataframe(segs_df, use_container_width=True,
+                         height=min(500, 65 + 35 * len(segs_df)))
+
+            with ddl3:
+                st.download_button(
+                    "⬇️ Download Duct Sizes (CSV)",
+                    data=dr["duct_csv"],
+                    file_name="duct_sizing.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            # BOQ
+            st.markdown("---")
+            st.subheader("📦 Bill of Quantities (BOQ)")
+            st.caption(
+                "Sheet metal area = 2×(W+H)×Length. "
+                "+25% allowance for fittings (elbows, tees, reducers). "
+                "Material: GI Sheet 0.63 mm gauge — SMACNA standard."
+            )
+
+            boq_lines = dr["boq_csv"].splitlines()
+            if len(boq_lines) > 1:
+                boq_cols = [
+                    "Duct Size", "Width mm", "Height mm", "Equiv ⌀ mm",
+                    "Runs", "Length m", "Perimeter m", "Sheet Metal m²",
+                    "Fittings m²", "Total m²", "Unit", "Notes",
+                ]
+                import csv as _csv, io as _io
+                boq_reader = list(_csv.reader(_io.StringIO(dr["boq_csv"])))
+                boq_df = pd.DataFrame(boq_reader[1:], columns=boq_reader[0])
+                st.dataframe(boq_df, use_container_width=True)
+
+            boq_dl1, _, _ = st.columns(3)
+            with boq_dl1:
+                st.download_button(
+                    "⬇️ Download BOQ (CSV)",
+                    data=dr["boq_csv"],
+                    file_name="duct_boq.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            # Engineering disclaimer
+            st.markdown(
+                "<div style='background:#1a1000;border:1px solid #664400;"
+                "border-radius:8px;padding:12px 16px;margin-top:16px;"
+                "font-size:12px;color:#aa8844;font-family:monospace'>"
+                "⚠️ <b>Engineering Disclaimer</b>: This duct layout is AI-generated "
+                "for preliminary estimation only. Final sizing, routing, pressure drop "
+                "calculations, and construction drawings must be reviewed and signed off "
+                "by a qualified HVAC / MEP engineer. "
+                "Standards reference: ASHRAE Fundamentals, SMACNA HVAC Duct Construction, NBC."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+    # Change selection button
     st.markdown('<div class="sdiv"></div>', unsafe_allow_html=True)
     ch1, ch2, ch3 = st.columns([3, 2, 3])
     with ch2:
         if st.button("🔄 Change Selection", key="re_select", use_container_width=True):
             ss["show_results"] = False
+            ss["duct_result"]  = None
             st.rerun()
-
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  FOOTER
-# # ═════════════════════════════════════════════════════════════════════════════
-# st.divider()
-# st.caption(
-#     #f"{mode_label}  |  "
-#     # f"Wall: {', '.join(sorted(WALL_LAYERS))}  |  "
-#     # f"Glass: {', '.join(sorted(GLASS_LAYERS)) or 'none'}  |  "
-#     f"{n_rooms} rooms ({n_glass} glass)  |  "
-#     f"🤖 {n_ai_classified}/{n_rooms} AI-classified  |  "
-#     f"Total: {summary_all['total_tr']:.2f} TR  |  "
-#     f"{summary_all['total_cfm']:.0f} CFM")

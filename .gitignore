@@ -54,3 +54,9 @@ fix_pytorch.py
 hvac_automation.py
 sample1.txt
 sample2.txt
+_ai_param_memory.json
+yolo_objects.py
+room_segmentation_cv.py
+main.py
+integration_guide.py
+dxf_render_cv.py
